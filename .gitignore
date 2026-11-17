@@ -1,0 +1,15 @@
+# 屏蔽数据和模型权重
+data/
+outputs/
+*.pkl
+*.npy
+*.pt
+*.csv
+*.gz
+*.jsonl
+
+# 屏蔽系统文件
+__pycache__/
+.vscode/
+.idea/
+.DS_Store

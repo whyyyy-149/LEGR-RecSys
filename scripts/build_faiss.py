@@ -37,6 +37,7 @@ print(f"索引中文档数量: {index.ntotal}")
 print(f"开始为 {len(inter)} 个用户生成 Top-{TOPK} 候选...")
 t0 = time.time()
 
+rng = np.random.default_rng(42)
 user_candidates = {}
 
 for uid, seq in inter.items():
@@ -67,9 +68,12 @@ for uid, seq in inter.items():
         if len(filtered_indices) == TOPK:
             break
             
-    # 补齐
+    # 补齐：随机抽不在历史里、也不重复的物品。
+    # 注意：不要用 0 补齐 —— 0 是合法 item id，会制造重复候选。
     while len(filtered_indices) < TOPK:
-        filtered_indices.append(0)
+        cand = int(rng.integers(0, embeddings.shape[0]))
+        if cand not in history_set and cand not in filtered_indices:
+            filtered_indices.append(cand)
         
     user_candidates[uid] = filtered_indices
 

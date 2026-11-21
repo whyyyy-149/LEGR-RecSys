@@ -50,7 +50,7 @@ for user_id, group in full.groupby("user_id"):
         continue
     inter[str(user_id)] = [item2idx[x] for x in seq_dedup]
 
-with open(out_dir / "musical_instruments.inter.json", "w") as f:
+with open(out_dir / "Musical_Instruments.inter.json", "w") as f:
     json.dump(inter, f)
 with open(out_dir / "item2idx.json", "w") as f:
     json.dump(item2idx, f)

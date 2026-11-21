@@ -6,35 +6,30 @@
 
 ## 2. 项目结构
 
+```text
 LEGR/
 ├── data/
 │   ├── raw/
-│   │   ├── benchmark/
-│   │   │   └── 5core/
-│   │   │       └── last_out_w_his/        # 原始 benchmark 切分数据
-│   │   │           ├── Musical_Instruments.train.csv.gz
-│   │   │           ├── Musical_Instruments.valid.csv.gz
-│   │   │           └── Musical_Instruments.test.csv.gz
-│   │   └── meta/                          # 原始 metadata
-│   │       └── meta_Musical_Instruments_clean.jsonl
-│   └── processed/
-│       └── Musical_Instruments/
-│           ├── Musical_Instruments.inter.json  # 用户行为序列
-│           ├── item2idx.json                   # 物品 ID 映射
-│           ├── item_embeddings.npy             # LLM 语义向量 (24587, 1024)
-│           ├── topk_candidates.pkl             # FAISS Top-50 召回结果
-│           └── rerank_data.pkl                 # 1正50负重排训练数据
+│   │   ├── benchmark/5core/last_out_w_his/  # 原始 benchmark 切分数据 (.csv.gz)
+│   │   └── meta/                            # 原始 metadata (.jsonl)
+│   └── processed/Musical_Instruments/
+│       ├── Musical_Instruments.inter.json   # 用户行为序列
+│       ├── item2idx.json                    # 物品 ID 映射
+│       ├── item_embeddings.npy              # LLM 语义向量 (24587, 1024)
+│       ├── topk_candidates.pkl              # FAISS Top-50 召回结果
+│       └── rerank_data.pkl                  # 1正+50负重排训练数据
 ├── outputs/
 │   └── sasrec/
-│       └── best_Musical_Instruments.pt         # SASRec 基线模型权重
+│       └── best_Musical_Instruments.pt      # SASRec 基线模型权重
 ├── scripts/
-│   ├── build_inter.py           # 构建 inter.json 数据
-│   ├── embed_items.py           # 调用 Qwen3 生成语义向量
-│   ├── build_faiss.py           # 构建 FAISS 索引并召回 (含历史过滤)
-│   ├── eval_recall.py           # 评估召回率 Recall@50
-│   ├── build_rerank_data.py     # 构造重排训练集 (1正+50困难负)
-│   └── train_reranker.py        # 训练并评估 LEGR (残差 Boosting)
+│   ├── build_inter.py                       # 构建 inter.json 数据
+│   ├── embed_items.py                       # 调用 Qwen3 生成语义向量
+│   ├── build_faiss.py                       # 构建 FAISS 索引并召回
+│   ├── eval_recall.py                       # 评估召回率 Recall@50
+│   ├── build_rerank_data.py                 # 构造重排训练集 (1正+50困难负)
+│   └── train_reranker.py                    # 训练并评估 LEGR (残差 Boosting)
 └── README.md
+```
 
 ## 3. 数据与评估协议
 - **数据规模**：57,439 用户，24,587 物品（5-core，leave-one-out 切分）。

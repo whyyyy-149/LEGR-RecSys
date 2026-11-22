@@ -124,12 +124,14 @@ def build_features(inter, emb, n_items, tag="v2"):
 
 # ---------------------------------------------------------------- dataset
 class PoolDataset(Dataset):
-    """训练时打乱候选顺序，避免"正例永远在第 0 位"被模型利用。"""
+    """训练时打乱候选顺序，避免"正例永远在第 0 位"被模型利用。
+    prior_dropout > 0 时随机丢弃协同先验，逼模型学会在没有 ID 信号时退回语义。"""
 
-    def __init__(self, rows, uid2row, shuffle_pool=False, seed=0):
+    def __init__(self, rows, uid2row, shuffle_pool=False, seed=0, prior_dropout=0.0):
         self.rows = rows
         self.uid2row = uid2row
         self.shuffle_pool = shuffle_pool
+        self.prior_dropout = prior_dropout
         self.rng = np.random.default_rng(seed)
 
     def __len__(self):
@@ -143,6 +145,8 @@ class PoolDataset(Dataset):
             pool, prior = pool[p], prior[p]
             tpos = int(np.where(p == tpos)[0][0])
         z = (prior - prior.mean()) / (prior.std() + 1e-6)
+        if self.prior_dropout > 0 and self.rng.random() < self.prior_dropout:
+            z = np.zeros_like(z)          # 模拟"该物品没有可用的协同信号"
         return (
             torch.from_numpy(np.asarray(pool, dtype=np.int64)),
             torch.from_numpy(np.asarray(z, dtype=np.float32)),
@@ -156,7 +160,8 @@ class ListwiseReranker(nn.Module):
     """真 listwise：候选之间做 self-attention，用户向量作为首 token。
     final = prior_z + gate * tanh(sem)，gate 逐候选、可学习。"""
 
-    def __init__(self, d_in, d=TEXT_DIM, heads=4, layers=2, dropout=0.1):
+    def __init__(self, d_in, d=TEXT_DIM, heads=4, layers=2, dropout=0.1,
+                 fusion="residual"):
         super().__init__()
         self.proj = nn.Linear(d_in, d)
         self.user_proj = nn.Linear(TEXT_DIM, d)
@@ -166,8 +171,14 @@ class ListwiseReranker(nn.Module):
         )
         self.enc = nn.TransformerEncoder(enc, layers)
         self.head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+        self.fusion = fusion
+        # residual: final = prior + g·tanh(sem)
         self.gate = nn.Sequential(nn.Linear(3, 16), nn.GELU(), nn.Linear(16, 1))
         nn.init.constant_(self.gate[-1].bias, -2.0)   # 初始 gate≈0.12，先信协同
+        # gated: final = a·prior + b·tanh(sem)，(a,b)=softmax(...)，按流行度条件化
+        self.gate2 = nn.Sequential(nn.Linear(4, 16), nn.GELU(), nn.Linear(16, 2))
+        with torch.no_grad():
+            self.gate2[-1].bias.copy_(torch.tensor([1.0, -1.0]))
         self.use_prior = True
 
     def forward(self, pool_feat, prior_z, user_vec):
@@ -175,13 +186,24 @@ class ListwiseReranker(nn.Module):
         u = self.user_proj(user_vec).unsqueeze(1) + self.type_emb[0]
         h = self.enc(torch.cat([u, c], 1))[:, 1:, :]
         sem = self.head(h).squeeze(-1)
+        tanh_sem = torch.tanh(sem)
+
+        if self.fusion == "gated":
+            # 双通道门控：允许模型在冷物品上把权重整体让给语义
+            pop = pool_feat[:, :, TEXT_DIM]
+            pstd = prior_z.std(1, keepdim=True).expand_as(prior_z)
+            w = torch.softmax(
+                self.gate2(torch.stack([prior_z, tanh_sem, pop, pstd], -1)), -1)
+            base = prior_z if self.use_prior else torch.zeros_like(prior_z)
+            return w[..., 0] * base + w[..., 1] * tanh_sem
+
         g = torch.sigmoid(
             self.gate(torch.stack(
-                [prior_z, torch.tanh(sem),
+                [prior_z, tanh_sem,
                  prior_z.std(1, keepdim=True).expand_as(prior_z)], -1))
         ).squeeze(-1)
         base = prior_z if self.use_prior else torch.zeros_like(prior_z)
-        return base + g * torch.tanh(sem)
+        return base + g * tanh_sem
 
 
 class LegacyReranker(nn.Module):
@@ -269,11 +291,11 @@ def predict(model, ds, item_feat, user_feat, bs=512):
     return np.concatenate(sc), np.concatenate(tp)
 
 
-def train_variant(name, seed, tr, va, te, item_feat, user_feat, args):
+def train_variant(name, seed, tr, va, te, item_feat, user_feat, args, te_corrupt=None):
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = (ListwiseReranker(item_feat.shape[1]) if name == "listwise"
-             else LegacyReranker(item_feat.shape[1]))
+    model = (ListwiseReranker(item_feat.shape[1], fusion=args.fusion)
+             if name == "listwise" else LegacyReranker(item_feat.shape[1]))
     model.use_prior = not args.no_prior
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     ce = nn.CrossEntropyLoss()
@@ -300,7 +322,27 @@ def train_variant(name, seed, tr, va, te, item_feat, user_feat, args):
                     {k: v.detach().clone() for k, v in model.state_dict().items()}, ep)
     model.load_state_dict(best[1])
     ts, tt = predict(model, te, item_feat, user_feat)
-    return hr_ndcg(target_rank(ts, tt))
+    hit, ndcg = hr_ndcg(target_rank(ts, tt))
+    if te_corrupt is None:
+        return hit, ndcg, None, None
+    cs, ct = predict(model, te_corrupt, item_feat, user_feat)
+    c_hit, c_ndcg = hr_ndcg(target_rank(cs, ct))
+    return hit, ndcg, c_hit, c_ndcg
+
+
+def corrupt_rows(rows, seed=0):
+    """把 target 的先验分替换成池内其它候选的分，模拟"该物品在 ID 空间没有表征"。
+    用于冷启动的因果实验：看模型在协同信号丢失时能退回语义多少。"""
+    rng = np.random.default_rng(seed)
+    out = []
+    for r in rows:
+        prior = np.asarray(r["prior"], dtype=np.float32).copy()
+        t = int(r["tpos"])
+        j = int(rng.integers(0, len(prior) - 1))
+        j = j if j < t else j + 1
+        prior[t] = prior[j]
+        out.append({**r, "prior": prior})
+    return out
 
 
 # ---------------------------------------------------------------- main
@@ -316,6 +358,11 @@ def main():
     ap.add_argument("--zero", default="", choices=["", "text", "pop"])
     ap.add_argument("--zero_user", action="store_true")
     ap.add_argument("--no_prior", action="store_true")
+    ap.add_argument("--prior_dropout", type=float, default=0.0,
+                    help="训练时随机丢弃协同先验的概率（冷启动鲁棒性）")
+    ap.add_argument("--fusion", default="residual", choices=["residual", "gated"],
+                    help="residual: prior+g·sem；gated: 双通道 softmax 门控")
+    ap.add_argument("--tag", default="", help="结果文件名后缀")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -342,9 +389,10 @@ def main():
     rows = {k: [rows_all[i] for i in v] for k, v in idx.items()}
     print(f"train/valid/test = {len(rows['train'])}/{len(rows['valid'])}/{len(rows['test'])}")
 
-    tr = PoolDataset(rows["train"], uid2row, True, seed=0)
+    tr = PoolDataset(rows["train"], uid2row, True, seed=0, prior_dropout=args.prior_dropout)
     va = PoolDataset(rows["valid"], uid2row, False)
     te = PoolDataset(rows["test"], uid2row, False)
+    te_corrupt = PoolDataset(corrupt_rows(rows["test"]), uid2row, False)
 
     te_rows = rows["test"]
     prior = np.stack([r["prior"] for r in te_rows])
@@ -367,33 +415,46 @@ def main():
     a_hit, a_ndcg = hr_ndcg(target_rank(anti, tpos))
     line("Anti-last-item (shortcut)", a_hit, a_ndcg, base=p_hit)
 
-    hits, res = {"SASRec prior": p_hit}, {"sasrec": float(p_hit.mean())}
+    hits, res = {"SASRec prior": p_hit, "Text-only": s_hit}, {"sasrec": float(p_hit.mean())}
     for v in args.variants:
         print(f"\n[{v}]")
-        hs, ns = [], []
+        hs, ns, chs = [], [], []
         for sd in args.seeds:
-            h, n = train_variant(v, sd, tr, va, te, item_feat, user_feat, args)
-            print(f"    seed{sd}: HR@10={h.mean():.4f}")
+            h, n, ch, cn = train_variant(v, sd, tr, va, te, item_feat, user_feat,
+                                         args, te_corrupt)
+            print(f"    seed{sd}: HR@10={h.mean():.4f}  (先验被破坏后 {ch.mean():.4f})")
             hs.append(h)
             ns.append(n)
+            chs.append(ch)
         h, n = np.mean(hs, 0), np.mean(ns, 0)
         line(f"{v} ({len(args.seeds)}seed avg)", h, n, base=p_hit)
+        ch = np.mean(chs, 0)
+        print(f"{'':<26} 冷启动探针（破坏 target 的协同先验）: "
+              f"HR@10 {h.mean():.4f} -> {ch.mean():.4f}  (SASRec 会退化到 ~0.10)")
         hits[v] = h
         res[v] = {"hr10": float(h.mean()), "ndcg10": float(n.mean()),
+                  "hr10_corrupt": float(ch.mean()),
                   "per_seed": [float(x.mean()) for x in hs]}
 
     pop = np.load(os.path.join(OUT_DIR, "item_pop.npy"))
     tg = np.array([r["target"] for r in te_rows])
     q1, q2 = np.percentile(pop[tg], [33, 66])
     print("\n分桶（按 target 物品交互量，测试集三等分）：")
-    print("bucket".ljust(12) + "".join(f"{k:>16}" for k in hits))
+    print("bucket".ljust(14) + "".join(f"{k:>16}" for k in hits))
     for lo, hi, nm in [(0, q1, "tail"), (q1, q2, "mid"), (q2, 1e9, "head")]:
         m = (pop[tg] >= lo) & (pop[tg] < hi)
-        print(f"{nm:<12}" + "".join(f"{v[m].mean():>16.4f}" for v in hits.values())
+        print(f"{nm:<14}" + "".join(f"{v[m].mean():>16.4f}" for v in hits.values())
               + f"  (n={m.sum()})")
+    p10 = np.percentile(pop, 10)
+    m = pop[tg] <= p10
+    print(f"{'cold(p10)':<14}" + "".join(f"{v[m].mean():>16.4f}" for v in hits.values())
+          + f"  (n={m.sum()})")
 
-    res.update({"pool": args.pool, "n_test": len(te_rows)})
-    with open(os.path.join(OUT_DIR, f"results_{args.pool}.json"), "w", encoding="utf-8") as f:
+    res.update({"pool": args.pool, "n_test": len(te_rows),
+                "prior_dropout": args.prior_dropout})
+    suffix = f"_{args.tag}" if args.tag else ""
+    with open(os.path.join(OUT_DIR, f"results_{args.pool}{suffix}.json"),
+              "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=2)
     print(f"\n耗时 {time.time() - t0:.0f}s")
 

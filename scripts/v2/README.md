@@ -132,7 +132,45 @@
 
 ---
 
-## 8. 运行
+## 8. 召回修复：训练双塔（4.32% → 10.20%）
+
+**动机**：热度基线 7.45%，而单 query 的语义召回只有 4.32%——连"推热门"都没过。
+瓶颈既然在召回，就应该先修召回，而不是继续调重排。
+
+**结构**：item 塔（1024d 文本 → MLP → 64d，L2 归一化）+ user 塔（历史文本 attention pooling → MLP → 64d）。
+损失用 InfoNCE（in-batch 负例）+ **logQ 校正**（抵消热门物品被采样的偏差）。
+
+**结果**（同一批 5,744 测试用户，全库 24,587 候选，屏蔽历史）：
+
+| 方法 | Recall@50 | 相对热度 |
+|---|---|---|
+| 随机 | 0.20% | −7.25pp |
+| 热度基线 | 7.45% | — |
+| 纯语义 FAISS（未训练，last-item） | 4.32% | **−3.13pp** |
+| 双塔（训练，last pooling） | 7.66% | +0.21pp |
+| **双塔（训练，attention pooling）** | **10.20%** [9.45, 10.93] | **+2.75pp** |
+| SASRec 全量 | 8.48% | +1.03pp |
+| 生成式 SID | 8.86% | +1.41pp |
+
+**消融与对照**（全部同一套评估代码）：
+
+| 变体 | Recall@50 | 说明 |
+|---|---|---|
+| 未训练 last-item | 4.28% | 复现了原 FAISS 的 4.32%，验证评估代码正确 |
+| + 训练（last pooling） | 7.66% | 学到的度量值 +3.4pp |
+| + attention pooling | **10.20%** | 会挑历史里的哪些物品，再 +2.5pp |
+| 去掉 logQ 校正 | 3.46% | **校正很关键**，去掉后比不训还差 |
+| 打乱用户历史（负对照） | 3.39% | 增益的 6.8pp 来自用户侧，不是物品偏置 |
+
+**结论**：召回从 4.32% 提到 10.20%（2.4 倍），超过热度基线 2.75pp，也超过 SASRec 1.7pp。
+按 10.2% 的召回上限估算，两阶段端到端 ≈ 10.2% × 0.6 ≈ 6.1%，已经高于 SASRec 单模型的 3.14%——
+**修好召回之后，整个系统的结论反过来了**。
+
+运行：`python scripts/v2/two_tower.py --epochs 6`（CPU 约 45 秒）
+
+---
+
+## 9. 运行
 
 ```bash
 # 1) 建池 + 重算 SASRec 先验（约 20s）
@@ -141,7 +179,10 @@ python scripts/v2/build_pool.py --kind random --n_rand 100
 # 2) 主实验（约 13 分钟 / 2 seed，CPU）
 python scripts/v2/run_v2.py --pool random --epochs 3 --seeds 0 1
 
-# 3) 消融
+# 3) 召回修复（约 45s）
+python scripts/v2/two_tower.py --epochs 6
+
+# 4) 消融
 python scripts/v2/run_v2.py --pool random --epochs 3 --seeds 0 --zero_user
 python scripts/v2/run_v2.py --pool hard   --seeds 0 1     # 复现 v1 的问题
 ```
